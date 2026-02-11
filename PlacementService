@@ -1,0 +1,84 @@
+local PlacementService = {}
+local GRID_SIZE = 4 
+
+function PlacementService.GetPlacementData(target, mouseHitPos, ghostModel, rotation)
+	local modelName = ghostModel.Name
+	local modelSize = ghostModel:GetExtentsSize()
+	local offsetAttribute = ghostModel:GetAttribute("Offset") or 0
+
+	local sizeXBlocks = ghostModel:GetAttribute("SizeX") or 1
+	local sizeYBlocks = ghostModel:GetAttribute("SizeY") or 1
+
+	local anchorBase = nil
+	if target then
+		if target:IsDescendantOf(workspace:FindFirstChild("PlacedStructures")) then
+			anchorBase = target.Parent
+		elseif target.Name == "Base" or target.Parent.Name == "Base" then
+			anchorBase = (target.Name == "Base") and target or target.Parent
+		end
+	end
+
+	-- 1. BUILDING SNAP LOGIC
+	if anchorBase and (anchorBase:IsA("BasePart") or anchorBase:IsA("Model")) then
+		local baseCF = anchorBase:GetPivot()
+		local baseSize = anchorBase:GetExtentsSize()
+		local localHit = baseCF:PointToObjectSpace(mouseHitPos)
+
+		local wallThickness = modelSize.Z 
+		local inwardShift = wallThickness / 2
+
+		if modelName == "Wall" or modelName == "Door Frame" or modelName == "Door" then
+			local yPos = (baseSize.Y / 2) + (modelSize.Y / 2) + offsetAttribute
+			if math.abs(localHit.X) > math.abs(localHit.Z) then
+				local side = localHit.X > 0 and 1 or -1
+				return baseCF * CFrame.new(side * (baseSize.X/2 - inwardShift), yPos, 0) * CFrame.Angles(0, math.rad(90), 0), true
+			else
+				local side = localHit.Z > 0 and 1 or -1
+				return baseCF * CFrame.new(0, yPos, side * (baseSize.Z/2 - inwardShift)), true
+			end
+		elseif modelName == "Floor" then
+			return baseCF * CFrame.new(0, baseSize.Y + offsetAttribute, 0), true
+		end
+	end
+
+	-- 2. GROUND SNAPPING LOGIC
+	-- Offset logic for even-sized blocks (keeps them centered on lines)
+	local offsetX = (sizeXBlocks % 2 == 0) and (GRID_SIZE / 2) or 0
+	local offsetZ = (sizeYBlocks % 2 == 0) and (GRID_SIZE / 2) or 0
+
+	local snappedX = math.round((mouseHitPos.X - offsetX) / GRID_SIZE) * GRID_SIZE + offsetX
+	local snappedZ = math.round((mouseHitPos.Z - offsetZ) / GRID_SIZE) * GRID_SIZE + offsetZ
+
+	local yPos = mouseHitPos.Y
+	if target and target:IsA("BasePart") then
+		local surfaceY = target.Position.Y + (target.Size.Y / 2)
+		yPos = surfaceY + (modelSize.Y / 2) + offsetAttribute
+	end
+
+	return CFrame.new(snappedX, yPos, snappedZ) * CFrame.Angles(0, math.rad(rotation), 0), false
+end
+
+function PlacementService.CreateGhostFromTool(tool)
+	local ghost = Instance.new("Model")
+	ghost.Name = tool.Name
+	for _, part in pairs(tool:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local p = part:Clone()
+			p.Transparency = 0.5
+			p.CastShadow = false
+			p.CanCollide, p.CanTouch, p.CanQuery = false, false, false
+			p.Anchored = true
+			p.Parent = ghost
+			if part.Name == "Handle" or part.Name == "Primary" then ghost.PrimaryPart = p end
+		end
+	end
+	if not ghost.PrimaryPart then ghost.PrimaryPart = ghost:FindFirstChildWhichIsA("BasePart") end
+
+	-- FIX: Correct loop for dictionary returned by GetAttributes()
+	for attrName, attrValue in pairs(tool:GetAttributes()) do 
+		ghost:SetAttribute(attrName, attrValue) 
+	end
+	return ghost
+end
+
+return PlacementService
