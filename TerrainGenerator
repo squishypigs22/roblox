@@ -69,29 +69,6 @@ local function getMaterialAndColor(x, z)
 	return Enum.Material.SmoothPlastic, baseLandColor, "Grass"
 end
 
-local function addSocketsToBlock(block)
-	local socketsFolder = Instance.new("Folder")
-	socketsFolder.Name = "Sockets"
-	socketsFolder.Parent = block
-
-	local halfX = block.Size.X / 2
-	local halfZ = block.Size.Z / 2
-
-	local socketData = {
-		{ name = "East", cframe = CFrame.new(halfX, 0, 0) },
-		{ name = "West", cframe = CFrame.new(-halfX, 0, 0) },
-		{ name = "North", cframe = CFrame.new(0, 0, -halfZ) },
-		{ name = "South", cframe = CFrame.new(0, 0, halfZ) },
-	}
-
-	for _, data in ipairs(socketData) do
-		local att = Instance.new("Attachment")
-		att.Name = data.name
-		att.CFrame = data.cframe
-		att.Parent = socketsFolder
-	end
-end
-
 local function createBlock(terrainFolder, position, topHeight)
 	if topHeight < seaCullY then
 		return nil
@@ -115,9 +92,6 @@ local function createBlock(terrainFolder, position, topHeight)
 	block:SetAttribute("Occupied", false)
 	block.Parent = terrainFolder
 
-	if name == "Grass" then
-		addSocketsToBlock(block)
-	end
 
 	return block
 end

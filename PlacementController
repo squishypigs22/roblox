@@ -3,33 +3,33 @@ local Mouse = Player:GetMouse()
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 
 local PlacementService = require(ReplicatedStorage:WaitForChild("PlacementService"))
 local PlaceEvent = ReplicatedStorage:WaitForChild("PlaceItemEvent")
 
-local currentTool, ghostModel = nil, nil
-local isPlacing, rotation, lastPlaceTime = false, 0, 0
-
 local GRID_SIZE = 4
 local MAX_DISTANCE = 50
-local RED_COLOR = Color3.fromRGB(255, 50, 50)
-local GREEN_COLOR = Color3.fromRGB(50, 255, 50)
+local SMOOTH_ALPHA = 0.35
+local PLACE_COOLDOWN = 0.2
 
-local lastTargetCFrame = CFrame.new()
-local isTweening = false
+local GREEN = Color3.fromRGB(50, 255, 50)
+local RED = Color3.fromRGB(255, 50, 50)
+
+local currentTool = nil
+local ghostModel = nil
+local isPlacing = false
+local rotation = 0
+local lastPlaceTime = 0
+local renderConn = nil
+
+local currentTargetCF = CFrame.new()
+local smoothedCF = CFrame.new()
 
 local function getFolders()
-	local terrain = workspace:FindFirstChild("CustomTerrain")
-	local structures = workspace:FindFirstChild("PlacedStructures")
-	return terrain, structures
+	return workspace:FindFirstChild("CustomTerrain"), workspace:FindFirstChild("PlacedStructures")
 end
 
-local function setGhostAttributes(model)
-	if not model then
-		return
-	end
-
+local function setGhostVisual(model)
 	for _, part in ipairs(model:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part.CanCollide = false
@@ -41,7 +41,7 @@ local function setGhostAttributes(model)
 	end
 end
 
-local function paintGhost(model, color)
+local function colorGhost(model, color)
 	for _, part in ipairs(model:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part.Color = color
@@ -49,104 +49,76 @@ local function paintGhost(model, color)
 	end
 end
 
-local function cleanup()
-	isPlacing = false
-	if ghostModel then
-		ghostModel:Destroy()
-		ghostModel = nil
+local function getRotatedFootprint(tool, yaw)
+	local sx = tool:GetAttribute("SizeX") or 1
+	local sy = tool:GetAttribute("SizeY") or 1
+	if yaw % 180 ~= 0 then
+		return sy, sx
 	end
-	currentTool = nil
-	isTweening = false
-	lastTargetCFrame = CFrame.new()
+	return sx, sy
 end
 
 local function snapToGrid(value)
 	return math.round(value / GRID_SIZE) * GRID_SIZE
 end
 
-local function getStructureSnapSocket(hitPosition)
-	local _, structuresFolder = getFolders()
-	if not structuresFolder then
-		return nil
-	end
-
-	local overlapParams = OverlapParams.new()
-	overlapParams.FilterType = Enum.RaycastFilterType.Include
-	overlapParams.FilterDescendantsInstances = { structuresFolder }
-
-	local nearbyParts = workspace:GetPartBoundsInBox(CFrame.new(hitPosition), Vector3.new(16, 12, 16), overlapParams)
-
-	local bestAttachment, bestDistance = nil, math.huge
-	for _, part in ipairs(nearbyParts) do
-		if part.Name == "Foundation" then
-			local sockets = part:FindFirstChild("Sockets")
-			if sockets then
-				for _, socket in ipairs(sockets:GetChildren()) do
-					if socket:IsA("Attachment") then
-						local worldPos = socket.WorldPosition
-						local d = (worldPos - hitPosition).Magnitude
-						if d < bestDistance then
-							bestDistance = d
-							bestAttachment = socket
-						end
-					end
-				end
-			end
-		end
-	end
-
-	if bestDistance <= 10 then
-		return bestAttachment
-	end
-
-	return nil
-end
-
-local function getTerrainHeightAt(x, z)
-	local terrainFolder = getFolders()
+local function getSupportHeightAt(x, z)
+	local terrainFolder, structuresFolder = getFolders()
 	if not terrainFolder then
 		return nil, nil
+	end
+
+	local include = { terrainFolder }
+	if structuresFolder then
+		table.insert(include, structuresFolder)
 	end
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
-	params.FilterDescendantsInstances = { terrainFolder }
+	params.FilterDescendantsInstances = include
 
-	local ray = workspace:Raycast(Vector3.new(x, 500, z), Vector3.new(0, -1200, 0), params)
-	if not ray then
+	local hit = workspace:Raycast(Vector3.new(x, 500, z), Vector3.new(0, -1200, 0), params)
+	if not hit then
 		return nil, nil
 	end
 
-	return ray.Position.Y, ray.Instance
+	return hit.Position.Y, hit.Instance
 end
 
-local function setup(char)
-	char.ChildAdded:Connect(function(child)
-		if child:IsA("Tool") and child:GetAttribute("Place") then
-			cleanup()
-			currentTool = child
-			isPlacing = true
-			ghostModel = PlacementService.CreateGhostFromTool(child)
-			ghostModel.Parent = workspace
-			setGhostAttributes(ghostModel)
-			child.Unequipped:Connect(cleanup)
+local function snapOnFoundationEdge(hitPart, hitPos, modelSize, toolName)
+	local localPos = hitPart.CFrame:PointToObjectSpace(hitPos)
+	local halfHit = hitPart.Size / 2
+	local halfModel = modelSize / 2
+	local topY = hitPart.Position.Y + halfHit.Y
+
+	if toolName == "Wall" then
+		if math.abs(localPos.X / halfHit.X) > math.abs(localPos.Z / halfHit.Z) then
+			local side = math.sign(localPos.X)
+			local x = hitPart.Position.X + side * (halfHit.X - halfModel.X)
+			return Vector3.new(x, topY + halfModel.Y, hitPart.Position.Z), (side > 0) and 90 or -90
+		else
+			local side = math.sign(localPos.Z)
+			local z = hitPart.Position.Z + side * (halfHit.Z - halfModel.Z)
+			return Vector3.new(hitPart.Position.X, topY + halfModel.Y, z), (side > 0) and 180 or 0
 		end
-	end)
+	end
+
+	if math.abs(localPos.X / halfHit.X) > math.abs(localPos.Z / halfHit.Z) then
+		local side = math.sign(localPos.X)
+		local x = hitPart.Position.X + side * (halfHit.X + halfModel.X)
+		return Vector3.new(x, topY + halfModel.Y, hitPart.Position.Z), rotation
+	else
+		local side = math.sign(localPos.Z)
+		local z = hitPart.Position.Z + side * (halfHit.Z + halfModel.Z)
+		return Vector3.new(hitPart.Position.X, topY + halfModel.Y, z), rotation
+	end
 end
 
-RunService.RenderStepped:Connect(function()
-	if not isPlacing or not currentTool or not ghostModel or not Player.Character then
-		return
-	end
-
+local function getPlacementTarget()
 	local terrainFolder, structuresFolder = getFolders()
-	if not terrainFolder then
-		return
+	if not terrainFolder or not ghostModel or not currentTool then
+		return nil, true
 	end
-
-	local isFoundation = currentTool.Name == "Foundation"
-	local isStructure = currentTool:GetAttribute("Structure") or false
-	local yOffset = currentTool:GetAttribute("Offset") or 0
 
 	local include = { terrainFolder }
 	if structuresFolder then
@@ -159,83 +131,184 @@ RunService.RenderStepped:Connect(function()
 
 	local mouseRay = workspace:Raycast(Mouse.UnitRay.Origin, Mouse.UnitRay.Direction * 1000, rayParams)
 	if not mouseRay then
-		return
+		return nil, true
 	end
 
+	local isStructure = currentTool:GetAttribute("Structure") or false
+	local isFoundation = currentTool.Name == "Foundation"
+	local yOffset = currentTool:GetAttribute("Offset") or 0
 	local modelSize = ghostModel:GetExtentsSize()
-	local targetCF
-	local blocked = false
 
-	if isStructure and not isFoundation then
-		local socket = getStructureSnapSocket(mouseRay.Position)
-		if socket then
-			local base = socket.WorldPosition
-			local yawByName = { North = 180, South = 0, East = 90, West = -90 }
-			local yaw = yawByName[socket.Name] or rotation
-			local finalPos = Vector3.new(base.X, base.Y + (modelSize.Y / 2) + yOffset, base.Z)
-			targetCF = CFrame.new(finalPos) * CFrame.Angles(0, math.rad(yaw), 0)
-		else
-			blocked = true
-			targetCF = CFrame.new(mouseRay.Position)
-		end
-	else
+	local targetYaw = rotation
+	local finalPos = nil
+
+	if mouseRay.Instance.Name == "Foundation" then
+		finalPos, targetYaw = snapOnFoundationEdge(mouseRay.Instance, mouseRay.Position, modelSize, currentTool.Name)
+		finalPos = finalPos + Vector3.new(0, yOffset, 0)
+	elseif not isStructure or isFoundation then
 		local snappedX = snapToGrid(mouseRay.Position.X)
 		local snappedZ = snapToGrid(mouseRay.Position.Z)
-		local topY = getTerrainHeightAt(snappedX, snappedZ)
-		if not topY then
-			blocked = true
-			topY = mouseRay.Position.Y
+		local supportY = getSupportHeightAt(snappedX, snappedZ)
+		if not supportY then
+			return nil, true
 		end
-
-		local finalPos = Vector3.new(snappedX, topY + (modelSize.Y / 2) + yOffset, snappedZ)
-		targetCF = CFrame.new(finalPos) * CFrame.Angles(0, math.rad(rotation), 0)
+		finalPos = Vector3.new(snappedX, supportY + (modelSize.Y / 2) + yOffset, snappedZ)
+	else
+		return nil, true
 	end
 
-	if (targetCF.Position - lastTargetCFrame.Position).Magnitude > 0.05 then
-		lastTargetCFrame = targetCF
-		isTweening = true
+	local targetCF = CFrame.new(finalPos) * CFrame.Angles(0, math.rad(targetYaw), 0)
+	return targetCF, false
+end
 
-		local tweenProxy = Instance.new("CFrameValue")
-		tweenProxy.Value = ghostModel:GetPivot()
-		local connection
-		connection = tweenProxy:GetPropertyChangedSignal("Value"):Connect(function()
-			ghostModel:PivotTo(tweenProxy.Value)
-		end)
-
-		local tween = TweenService:Create(tweenProxy, TweenInfo.new(0.05, Enum.EasingStyle.Linear), { Value = targetCF })
-		tween.Completed:Connect(function()
-			isTweening = false
-			connection:Disconnect()
-			tweenProxy:Destroy()
-		end)
-		tween:Play()
+local function footprintSupported(targetCF)
+	local terrainFolder, structuresFolder = getFolders()
+	if not terrainFolder then
+		return false
 	end
 
-	if Player.Character:FindFirstChild("HumanoidRootPart") then
-		if (Player.Character.HumanoidRootPart.Position - targetCF.Position).Magnitude > MAX_DISTANCE then
-			blocked = true
-		end
+	local include = { terrainFolder }
+	if structuresFolder then
+		table.insert(include, structuresFolder)
 	end
 
-	if structuresFolder and isStructure then
-		local overlapParams = OverlapParams.new()
-		overlapParams.FilterType = Enum.RaycastFilterType.Include
-		overlapParams.FilterDescendantsInstances = { structuresFolder }
-		local collisions = workspace:GetPartBoundsInBox(targetCF, modelSize * 0.9, overlapParams)
-		for _, part in ipairs(collisions) do
-			if part.Name ~= "Foundation" then
-				blocked = true
-				break
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = include
+
+	local sx, sy = getRotatedFootprint(currentTool, rotation)
+	local startX = targetCF.Position.X - (sx * GRID_SIZE / 2)
+	local startZ = targetCF.Position.Z - (sy * GRID_SIZE / 2)
+
+	for x = 0, sx - 1 do
+		for z = 0, sy - 1 do
+			local cx = startX + (x * GRID_SIZE) + (GRID_SIZE / 2)
+			local cz = startZ + (z * GRID_SIZE) + (GRID_SIZE / 2)
+			local hit = workspace:Raycast(Vector3.new(cx, targetCF.Position.Y + 200, cz), Vector3.new(0, -400, 0), params)
+			if not hit then
+				return false
+			end
+			if hit.Instance:GetAttribute("Occupied") == true then
+				return false
 			end
 		end
 	end
 
-	ghostModel:SetAttribute("CanPlace", not blocked)
-	paintGhost(ghostModel, (not blocked) and GREEN_COLOR or RED_COLOR)
-end)
+	return true
+end
+
+local function isBlockedAt(targetCF)
+	if not currentTool or not ghostModel or not Player.Character then
+		return true
+	end
+
+	local hrp = Player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return true
+	end
+
+	if (hrp.Position - targetCF.Position).Magnitude > MAX_DISTANCE then
+		return true
+	end
+
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+	overlapParams.FilterDescendantsInstances = { Player.Character, ghostModel }
+
+	local modelSize = ghostModel:GetExtentsSize()
+	local isStructure = currentTool:GetAttribute("Structure") or false
+	local hits = workspace:GetPartBoundsInBox(targetCF, modelSize * 0.95, overlapParams)
+	for _, part in ipairs(hits) do
+		if part.Name ~= "Ocean" and part.Transparency < 0.98 then
+			if isStructure and part.Name == "Foundation" then
+				-- allowed support contact
+			elseif part.Name ~= "Grass" and part.Name ~= "Sand" then
+				return true
+			end
+		end
+	end
+
+	if (currentTool.Name == "Foundation") then
+		if not footprintSupported(targetCF) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function stopRenderLoop()
+	if renderConn then
+		renderConn:Disconnect()
+		renderConn = nil
+	end
+end
+
+local function cleanup()
+	stopRenderLoop()
+	isPlacing = false
+	currentTool = nil
+	if ghostModel then
+		ghostModel:Destroy()
+		ghostModel = nil
+	end
+end
+
+local function startPlacement(tool)
+	cleanup()
+	currentTool = tool
+	isPlacing = true
+	ghostModel = PlacementService.CreateGhostFromTool(tool)
+	ghostModel.Parent = workspace
+	setGhostVisual(ghostModel)
+	currentTargetCF = ghostModel:GetPivot()
+	smoothedCF = currentTargetCF
+
+	renderConn = RunService.RenderStepped:Connect(function()
+		if not isPlacing or not currentTool or not ghostModel then
+			return
+		end
+
+		local targetCF, invalid = getPlacementTarget()
+		if invalid or not targetCF then
+			ghostModel:SetAttribute("CanPlace", false)
+			colorGhost(ghostModel, RED)
+			return
+		end
+
+		currentTargetCF = targetCF
+		smoothedCF = smoothedCF:Lerp(currentTargetCF, SMOOTH_ALPHA)
+		if ghostModel and ghostModel.Parent then
+			ghostModel:PivotTo(smoothedCF)
+		end
+
+		local blocked = isBlockedAt(currentTargetCF)
+		ghostModel:SetAttribute("CanPlace", not blocked)
+		colorGhost(ghostModel, blocked and RED or GREEN)
+	end)
+
+	tool.Unequipped:Connect(function()
+		cleanup()
+	end)
+end
+
+local function setupCharacter(char)
+	char.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") and child:GetAttribute("Place") then
+			startPlacement(child)
+		end
+	end)
+
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") and child:GetAttribute("Place") then
+			startPlacement(child)
+			break
+		end
+	end
+end
 
 UserInputService.InputBegan:Connect(function(input, processed)
-	if processed or not isPlacing or not currentTool then
+	if processed or not isPlacing or not currentTool or not ghostModel then
 		return
 	end
 
@@ -244,18 +317,17 @@ UserInputService.InputBegan:Connect(function(input, processed)
 	end
 
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		if tick() - lastPlaceTime < 0.2 then
+		if tick() - lastPlaceTime < PLACE_COOLDOWN then
 			return
 		end
-
-		if ghostModel and ghostModel:GetAttribute("CanPlace") and not isTweening then
+		if ghostModel:GetAttribute("CanPlace") then
 			lastPlaceTime = tick()
-			PlaceEvent:FireServer(currentTool, ghostModel:GetPivot())
+			PlaceEvent:FireServer(currentTool, currentTargetCF, rotation)
 		end
 	end
 end)
 
 if Player.Character then
-	setup(Player.Character)
+	setupCharacter(Player.Character)
 end
-Player.CharacterAdded:Connect(setup)
+Player.CharacterAdded:Connect(setupCharacter)
