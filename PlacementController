@@ -22,27 +22,7 @@ detector.Transparency = 1
 detector.CanCollide = false
 detector.CanQuery = false 
 detector.Anchored = true
-detector.Size = Vector3.new(GRID_SIZE * 0.9, 6, GRID_SIZE * 0.9) 
-
--- Helper: Find closest socket and enforce height locking
-local function getClosestSocket(hitPart, socketName, mousePosition)
-	local socketsFolder = hitPart:FindFirstChild("Sockets")
-	if not socketsFolder then return nil end
-
-	local closestSocket = nil
-	local shortestDist = math.huge
-
-	for _, socket in ipairs(socketsFolder:GetChildren()) do
-		if socket:IsA("Attachment") and socket.Name == socketName then
-			local dist = (Vector2.new(socket.WorldPosition.X, socket.WorldPosition.Z) - Vector2.new(mousePosition.X, mousePosition.Z)).Magnitude
-			if dist < shortestDist then
-				shortestDist = dist
-				closestSocket = socket
-			end
-		end
-	end
-	return closestSocket
-end
+detector.Size = Vector3.new(GRID_SIZE * 4, 6, GRID_SIZE * 4) 
 
 local function setGhostAttributes(model)
 	if not model then return end
@@ -66,14 +46,27 @@ end
 
 local function getTargetParts(isStructure)
 	local targets = {}
-	for _, item in ipairs(workspace:GetDescendants()) do
-		if item:IsA("BasePart") then
+	local folder = workspace:FindFirstChild("CustomTerrain")
+	local structures = workspace:FindFirstChild("PlacedStructures")
+
+	if folder then
+		for _, item in ipairs(folder:GetChildren()) do
 			if isStructure then
 				if item.Name == "Foundation" or item:GetAttribute("Structure") then
 					table.insert(targets, item)
 				end
 			else
 				if item.Name == "Grass" or item.Name == "Foundation" then
+					table.insert(targets, item)
+				end
+			end
+		end
+	end
+
+	if structures then
+		for _, item in ipairs(structures:GetDescendants()) do
+			if item:IsA("BasePart") then
+				if isStructure and (item.Name == "Foundation" or item:GetAttribute("Structure")) then
 					table.insert(targets, item)
 				end
 			end
@@ -117,68 +110,119 @@ RunService.RenderStepped:Connect(function()
 	local mouseRay = workspace:Raycast(Mouse.UnitRay.Origin, Mouse.UnitRay.Direction * 1000, params)
 	if not mouseRay then return end
 
-	local hitPart = mouseRay.Instance
-	local targetCFrame = CFrame.new()
-	local isBlocked = false
-	local maxHeight = -math.huge
-	local _, modelSize = ghostModel:GetBoundingBox()
+	local activeGrid = GRID_SIZE
+	if not isStructure and mouseRay.Instance.Name == "Foundation" then
+		activeGrid = 2 
+	end
 
-	-- GRID SNAPPING LOGIC
-	local activeGrid = (not isStructure and hitPart.Name == "Foundation") and 2 or GRID_SIZE
-	local function getSnap(pos, size, g)
+	local function getSnap(pos, size, customGrid)
+		local g = customGrid or activeGrid
 		return (size % 2 ~= 0) and math.round(pos / g) * g or (math.floor(pos / g) * g) + (g / 2)
 	end
 
-	local snappedX = getSnap(mouseRay.Position.X, worldWidth, activeGrid)
-	local snappedZ = getSnap(mouseRay.Position.Z, worldDepth, activeGrid)
-	local finalRotation = rotation
+	local snappedX = getSnap(mouseRay.Position.X, worldWidth)
+	local snappedZ = getSnap(mouseRay.Position.Z, worldDepth)
+	local currentRotation = rotation
+	local maxHeight = -math.huge
+	local isBlocked = false
+	local isSnappedToNeighbor = false
+
+	local ghostPivot, modelSize = ghostModel:GetBoundingBox()
 
 	if isWall then
-		local socket = getClosestSocket(hitPart, "WallSocket", mouseRay.Position)
-		if socket then
-			targetCFrame = socket.WorldCFrame * CFrame.new(0, (modelSize.Y / 2) + yOffsetAttr, 0)
+		local hitPart = mouseRay.Instance
+		local localPos = hitPart.CFrame:PointToObjectSpace(mouseRay.Position)
+		local halfHit = hitPart.Size / 2
+		local halfWall = modelSize / 2
+
+		if math.abs(localPos.X/halfHit.X) > math.abs(localPos.Z/halfHit.Z) then
+			local side = math.sign(localPos.X)
+			localPos = Vector3.new(side * (halfHit.X - halfWall.X), 0, 0)
+			currentRotation = (side > 0) and 90 or -90
 		else
-			isBlocked = true 
+			local side = math.sign(localPos.Z)
+			localPos = Vector3.new(0, 0, side * (halfHit.Z - halfWall.Z))
+			currentRotation = (side > 0) and 180 or 0
 		end
-	elseif isFoundation then
-		-- Neighbor Snapping via Sockets
-		local socket = getClosestSocket(hitPart, "FoundationSocket", mouseRay.Position)
-		if socket then
-			targetCFrame = socket.WorldCFrame
-			maxHeight = socket.WorldPosition.Y
-		else
-			-- Manual Foundation on Grass
-			maxHeight = mouseRay.Position.Y
-			targetCFrame = CFrame.new(snappedX, maxHeight + (modelSize.Y / 2) + yOffsetAttr, snappedZ) * CFrame.Angles(0, math.rad(rotation), 0)
-		end
-	else
-		-- General Structures / Decor
+		local worldPos = hitPart.CFrame:PointToWorldSpace(localPos)
+		snappedX, snappedZ = worldPos.X, worldPos.Z
 		maxHeight = hitPart.Position.Y + (hitPart.Size.Y / 2)
-		targetCFrame = CFrame.new(snappedX, maxHeight + (modelSize.Y / 2) + yOffsetAttr, snappedZ) * CFrame.Angles(0, math.rad(rotation), 0)
-	end
+	elseif isStructure and not isFoundation then
+		snappedX = getSnap(mouseRay.Position.X, worldWidth, 2)
+		snappedZ = getSnap(mouseRay.Position.Z, worldDepth, 2)
+		maxHeight = mouseRay.Instance.Position.Y + (mouseRay.Instance.Size.Y / 2)
+	else
+		detector.Position = Vector3.new(snappedX, mouseRay.Position.Y, snappedZ)
+		local overlapParams = OverlapParams.new()
+		overlapParams.FilterType = Enum.RaycastFilterType.Include
+		overlapParams.FilterDescendantsInstances = {workspace}
 
-	-- HEIGHT LOCKING: Prevent sliding down the side of blocks
-	if isFoundation and not isBlocked then
-		detector.Position = targetCFrame.Position
-		local op = OverlapParams.new()
-		op.FilterDescendantsInstances = {workspace}
-		op.FilterType = Enum.RaycastFilterType.Include
+		local snapHeight = nil
+		local overlappingParts = workspace:GetPartsInPart(detector, overlapParams)
 
-		local parts = workspace:GetPartsInPart(detector, op)
-		for _, p in ipairs(parts) do
-			if p.Name == "Foundation" and p ~= ghostModel then
-				isBlocked = true -- Prevent clipping into other foundations
+		local closestDist = math.huge
+		local bestPart = nil
+
+		if isFoundation then
+			for _, part in ipairs(overlappingParts) do
+				if part.Name == "Foundation" then
+					local dist = (part.Position - detector.Position).Magnitude
+					if dist < closestDist then
+						closestDist = dist
+						bestPart = part
+					end
+				end
+			end
+
+			if bestPart then
+				local lPos = bestPart.CFrame:PointToObjectSpace(mouseRay.Position)
+				local totalOffset = 1 * GRID_SIZE 
+				local oX, oZ = 0, 0
+				if math.abs(lPos.X) > math.abs(lPos.Z) then
+					oX = math.sign(lPos.X) * totalOffset
+				else
+					oZ = math.sign(lPos.Z) * totalOffset
+				end
+				snappedX = bestPart.Position.X + oX
+				snappedZ = bestPart.Position.Z + oZ
+				snapHeight = bestPart.Position.Y + (bestPart.Size.Y / 2)
+				isSnappedToNeighbor = true
 			end
 		end
+
+		local startX, startZ = snappedX - (worldWidth * activeGrid / 2), snappedZ - (worldDepth * activeGrid / 2)
+		local tilesFound = 0
+
+		for x = 0, sx - 1 do
+			for z = 0, sy - 1 do
+				local cx, cz = startX + (x * activeGrid) + (activeGrid / 2), startZ + (z * activeGrid) + (activeGrid / 2)
+				local ray = workspace:Raycast(Vector3.new(cx, 500, cz), Vector3.new(0, -1000, 0), params)
+				if ray then
+					tilesFound += 1
+					if not snapHeight and ray.Position.Y > maxHeight then maxHeight = ray.Position.Y end
+					if isFoundation then
+						if ray.Instance.Name == "Foundation" then isBlocked = true end
+						if ray.Instance.Name == "Grass" and ray.Instance:GetAttribute("Occupied") then isBlocked = true end
+					end
+				end
+			end
+		end
+		if snapHeight then maxHeight = snapHeight end
+		if tilesFound < (sx * sy) then isBlocked = true end
 	end
 
-	-- Smooth Tweening
-	if (targetCFrame.Position - lastTargetCFrame.Position).Magnitude > 0.1 or rotation ~= finalRotation then
+	local antiClipOffset = (isSnappedToNeighbor) and 0 or (isStructure and -0.05 or 0.01)
+	local finalPos = Vector3.new(snappedX, maxHeight + (modelSize.Y / 2) + yOffsetAttr + antiClipOffset, snappedZ)
+	local targetCFrame = CFrame.new(finalPos) * CFrame.Angles(0, math.rad(currentRotation), 0)
+
+	if (targetCFrame.Position - lastTargetCFrame.Position).Magnitude > 0.1 or rotation ~= currentRotation then
 		lastTargetCFrame = targetCFrame
 		isTweening = true
+		local tInfo = TweenInfo.new(0.05, Enum.EasingStyle.Linear)
 		local tPart = ghostModel.PrimaryPart or ghostModel:FindFirstChildWhichIsA("BasePart")
+
 		if tPart then
-			local tween = TweenService:Create(tPart, TweenInfo.new(0.08, Enum.EasingStyle.Cubic), {CFrame = targetCFrame})
+			local tween = TweenService:Create(tPart, tInfo, {CFrame = targetCFrame})
 			tween.Completed:Connect(function() isTweening = false end)
 			tween:Play()
 		else
@@ -187,27 +231,23 @@ RunService.RenderStepped:Connect(function()
 		end
 	end
 
-	-- ANTI-CLIP & OCCUPANCY
-	if not isBlocked then
+	if isStructure and not isBlocked then
 		local overlapParams = OverlapParams.new()
 		overlapParams.FilterDescendantsInstances = {ghostModel, Player.Character}
 		overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-		local collisions = workspace:GetPartBoundsInBox(targetCFrame, modelSize * 0.95, overlapParams)
+		local collisions = workspace:GetPartBoundsInBox(targetCFrame, modelSize * 0.9, overlapParams)
 		for _, part in ipairs(collisions) do
 			if part:GetAttribute("Structure") or part.Name == "Wall" then 
-				isBlocked = true break 
+				isBlocked = true 
+				break 
 			end
 		end
 	end
 
-	if (Player.Character.HumanoidRootPart.Position - targetCFrame.Position).Magnitude > MAX_DISTANCE then isBlocked = true end
-
+	if (Player.Character.HumanoidRootPart.Position - finalPos).Magnitude > MAX_DISTANCE then isBlocked = true end
 	local ghostColor = (not isBlocked) and GREEN_COLOR or RED_COLOR
 	for _, p in pairs(ghostModel:GetDescendants()) do if p:IsA("BasePart") then p.Color = ghostColor end end
 	ghostModel:SetAttribute("CanPlace", not isBlocked)
-
-	-- Update global reference for firing event
-	_G.FinalTargetCFrame = targetCFrame 
 end)
 
 UserInputService.InputBegan:Connect(function(i, p)
@@ -217,7 +257,12 @@ UserInputService.InputBegan:Connect(function(i, p)
 		if tick() - lastPlaceTime < 0.2 then return end 
 		if ghostModel and ghostModel:GetAttribute("CanPlace") and not isTweening then
 			lastPlaceTime = tick()
-			PlaceEvent:FireServer(currentTool, _G.FinalTargetCFrame)
+			PlaceEvent:FireServer(currentTool, ghostModel:GetPivot())
+			task.delay(0.1, function()
+				if currentTool then
+					cachedTargets = getTargetParts(currentTool:GetAttribute("Structure") or false)
+				end
+			end)
 		end
 	end
 end)
