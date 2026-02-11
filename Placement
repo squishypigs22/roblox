@@ -1,94 +1,262 @@
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
 local PlaceEvent = ReplicatedStorage:WaitForChild("PlaceItemEvent")
+
 local GRID_SIZE = 4
+local PLACE_COOLDOWN = 0.2
+local MAX_DISTANCE = 55
 
 local itemFolders = {
 	ReplicatedStorage:WaitForChild("CraftableItems"),
 	ReplicatedStorage:WaitForChild("CraftingBenchItems"),
-	ReplicatedStorage:WaitForChild("Resources")
+	ReplicatedStorage:WaitForChild("Resources"),
 }
 
-local playerCooldowns = {} 
+local playerCooldowns = {}
 
 local function findModel(name)
 	for _, folder in ipairs(itemFolders) do
 		local found = folder:FindFirstChild(name)
-		if found then return found end
+		if found then
+			return found
+		end
 	end
 	return nil
 end
 
-PlaceEvent.OnServerEvent:Connect(function(player, tool, targetCFrame)
-	if playerCooldowns[player] and tick() - playerCooldowns[player] < 0.2 then return end
-	playerCooldowns[player] = tick()
-
-	if not tool or not tool:IsA("Tool") or typeof(targetCFrame) ~= "CFrame" then return end
-
-	local character = player.Character
-	if not character or not character:FindFirstChild("HumanoidRootPart") then return end
-
-	if (character.HumanoidRootPart.Position - targetCFrame.Position).Magnitude > 55 then 
-		return 
+local function addFoundationSockets(part)
+	local existing = part:FindFirstChild("Sockets")
+	if existing then
+		existing:Destroy()
 	end
 
-	local toolName = tool.Name
-	local isStructure = tool:GetAttribute("Structure") or false
-	local sx, sy = tool:GetAttribute("SizeX") or 1, tool:GetAttribute("SizeY") or 1
+	local sockets = Instance.new("Folder")
+	sockets.Name = "Sockets"
+	sockets.Parent = part
+
+	local halfX = part.Size.X / 2
+	local halfZ = part.Size.Z / 2
+	local defs = {
+		{ "East", CFrame.new(halfX, 0, 0) },
+		{ "West", CFrame.new(-halfX, 0, 0) },
+		{ "North", CFrame.new(0, 0, -halfZ) },
+		{ "South", CFrame.new(0, 0, halfZ) },
+	}
+
+	for _, def in ipairs(defs) do
+		local att = Instance.new("Attachment")
+		att.Name = def[1]
+		att.CFrame = def[2]
+		att.Parent = sockets
+	end
+end
+
+local function getNearestFoundationSocket(targetPosition)
+	local structuresFolder = workspace:FindFirstChild("PlacedStructures")
+	if not structuresFolder then
+		return nil
+	end
 
 	local overlapParams = OverlapParams.new()
-	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-	overlapParams.FilterDescendantsInstances = {character}
+	overlapParams.FilterType = Enum.RaycastFilterType.Include
+	overlapParams.FilterDescendantsInstances = { structuresFolder }
 
-	local bounds = workspace:GetPartBoundsInBox(targetCFrame, Vector3.new(0.5, 0.5, 0.5), overlapParams)
-	for _, part in ipairs(bounds) do
-		if part:GetAttribute("Occupied") or (isStructure and part:GetAttribute("Structure")) then
-			return 
-		end
-	end
+	local nearbyParts = workspace:GetPartBoundsInBox(CFrame.new(targetPosition), Vector3.new(16, 12, 16), overlapParams)
+	local bestSocket, bestDistance = nil, math.huge
 
-	local sourceModel = findModel(toolName)
-	if not sourceModel then return end
-
-	local placedItem = sourceModel:Clone()
-
-	if placedItem:IsA("Tool") then
-		local newModel = Instance.new("Model")
-		newModel.Name = toolName
-		for _, child in ipairs(placedItem:GetChildren()) do
-			if child:IsA("BasePart") or child:IsA("Model") then child.Parent = newModel end
-		end
-		placedItem = newModel
-	else
-		placedItem.Name = toolName
-	end
-
-	placedItem:PivotTo(targetCFrame)
-
-	for _, desc in ipairs(placedItem:GetDescendants()) do
-		if desc:IsA("BasePart") then 
-			desc.Anchored = true
-			desc.CanCollide = true
-			if isStructure then 
-				desc:SetAttribute("Structure", true) 
-			elseif toolName == "Foundation" then
-				desc.Name = "Foundation"
+	for _, part in ipairs(nearbyParts) do
+		if part.Name == "Foundation" then
+			local sockets = part:FindFirstChild("Sockets")
+			if sockets then
+				for _, socket in ipairs(sockets:GetChildren()) do
+					if socket:IsA("Attachment") then
+						local d = (socket.WorldPosition - targetPosition).Magnitude
+						if d < bestDistance then
+							bestDistance = d
+							bestSocket = socket
+						end
+					end
+				end
 			end
-		elseif desc:IsA("Script") or desc:IsA("LocalScript") then 
-			desc:Destroy() 
+		end
+	end
+
+	if bestDistance <= 4 then
+		return bestSocket
+	end
+
+	return nil
+end
+
+local function hasSpaceForPlacement(player, tool, targetCFrame, sourceModel)
+	local character = player.Character
+	if not character then
+		return false
+	end
+
+	local terrainFolder = workspace:FindFirstChild("CustomTerrain")
+	if not terrainFolder then
+		return false
+	end
+
+	local structuresFolder = workspace:FindFirstChild("PlacedStructures")
+	local isStructure = tool:GetAttribute("Structure") or false
+	local isFoundation = tool.Name == "Foundation"
+
+	local extents = sourceModel:IsA("Model") and sourceModel:GetExtentsSize() or sourceModel.Size
+	local checkSize = Vector3.new(math.max(extents.X, 1), math.max(extents.Y, 1), math.max(extents.Z, 1))
+
+	local includeList = { terrainFolder }
+	if structuresFolder then
+		table.insert(includeList, structuresFolder)
+	end
+
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Include
+	overlapParams.FilterDescendantsInstances = includeList
+
+	local touching = workspace:GetPartBoundsInBox(targetCFrame, checkSize * 0.9, overlapParams)
+	for _, part in ipairs(touching) do
+		if part:GetAttribute("Occupied") == true then
+			if not (isStructure and part.Name == "Foundation") then
+				return false
+			end
 		end
 	end
 
 	if not isStructure then
+		local sx = tool:GetAttribute("SizeX") or 1
+		local sy = tool:GetAttribute("SizeY") or 1
 		local startX = targetCFrame.Position.X - (sx * GRID_SIZE / 2)
 		local startZ = targetCFrame.Position.Z - (sy * GRID_SIZE / 2)
+
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Include
+		rayParams.FilterDescendantsInstances = { terrainFolder }
 
 		for x = 0, sx - 1 do
 			for z = 0, sy - 1 do
 				local checkX = startX + (x * GRID_SIZE) + (GRID_SIZE / 2)
 				local checkZ = startZ + (z * GRID_SIZE) + (GRID_SIZE / 2)
-				local occRay = workspace:Raycast(Vector3.new(checkX, targetCFrame.Position.Y + 2, checkZ), Vector3.new(0, -5, 0))
-				if occRay and occRay.Instance.Name == "Grass" then 
-					occRay.Instance:SetAttribute("Occupied", true) 
+				local ray = workspace:Raycast(Vector3.new(checkX, targetCFrame.Position.Y + 200, checkZ), Vector3.new(0, -400, 0), rayParams)
+				if not ray then
+					return false
+				end
+				if ray.Instance:GetAttribute("Occupied") == true then
+					return false
+				end
+			end
+		end
+	end
+
+	return true
+end
+
+PlaceEvent.OnServerEvent:Connect(function(player, tool, targetCFrame)
+	local now = tick()
+	if playerCooldowns[player] and (now - playerCooldowns[player]) < PLACE_COOLDOWN then
+		return
+	end
+	playerCooldowns[player] = now
+
+	if not tool or not tool:IsA("Tool") or typeof(targetCFrame) ~= "CFrame" then
+		return
+	end
+
+	local character = player.Character
+	if not character or not character:FindFirstChild("HumanoidRootPart") then
+		return
+	end
+
+	local validParent = tool.Parent == character or tool.Parent == player:FindFirstChildOfClass("Backpack")
+	if not validParent then
+		return
+	end
+
+	if (character.HumanoidRootPart.Position - targetCFrame.Position).Magnitude > MAX_DISTANCE then
+		return
+	end
+
+	local sourceModel = findModel(tool.Name)
+	if not sourceModel then
+		return
+	end
+
+	local isStructure = tool:GetAttribute("Structure") or false
+	local isFoundation = tool.Name == "Foundation"
+	if isStructure and not isFoundation then
+		local socket = getNearestFoundationSocket(targetCFrame.Position)
+		if not socket then
+			return
+		end
+
+		local extents = sourceModel:IsA("Model") and sourceModel:GetExtentsSize() or sourceModel.Size
+		local yawByName = { North = 180, South = 0, East = 90, West = -90 }
+		local yaw = yawByName[socket.Name] or 0
+		targetCFrame = CFrame.new(socket.WorldPosition + Vector3.new(0, extents.Y / 2, 0)) * CFrame.Angles(0, math.rad(yaw), 0)
+	end
+
+	if not hasSpaceForPlacement(player, tool, targetCFrame, sourceModel) then
+		return
+	end
+
+	local placedItem = sourceModel:Clone()
+	if placedItem:IsA("Tool") then
+		local model = Instance.new("Model")
+		model.Name = tool.Name
+		for _, child in ipairs(placedItem:GetChildren()) do
+			if child:IsA("BasePart") or child:IsA("Model") then
+				child.Parent = model
+			end
+		end
+		placedItem = model
+	else
+		placedItem.Name = tool.Name
+	end
+
+	for _, desc in ipairs(placedItem:GetDescendants()) do
+		if desc:IsA("Script") or desc:IsA("LocalScript") then
+			desc:Destroy()
+		end
+	end
+
+	placedItem:PivotTo(targetCFrame)
+
+	for _, desc in ipairs(placedItem:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			desc.Anchored = true
+			desc.CanCollide = true
+			desc.CanQuery = true
+			desc:SetAttribute("Occupied", not isFoundation)
+			if isStructure then
+				desc:SetAttribute("Structure", true)
+			end
+			if isFoundation then
+				desc.Name = "Foundation"
+				addFoundationSockets(desc)
+			end
+		end
+	end
+
+	local terrainFolder = workspace:FindFirstChild("CustomTerrain")
+	if terrainFolder and not isStructure then
+		local sx = tool:GetAttribute("SizeX") or 1
+		local sy = tool:GetAttribute("SizeY") or 1
+		local startX = targetCFrame.Position.X - (sx * GRID_SIZE / 2)
+		local startZ = targetCFrame.Position.Z - (sy * GRID_SIZE / 2)
+
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Include
+		rayParams.FilterDescendantsInstances = { terrainFolder }
+
+		for x = 0, sx - 1 do
+			for z = 0, sy - 1 do
+				local checkX = startX + (x * GRID_SIZE) + (GRID_SIZE / 2)
+				local checkZ = startZ + (z * GRID_SIZE) + (GRID_SIZE / 2)
+				local ray = workspace:Raycast(Vector3.new(checkX, targetCFrame.Position.Y + 200, checkZ), Vector3.new(0, -400, 0), rayParams)
+				if ray and ray.Instance and ray.Instance.Name == "Grass" then
+					ray.Instance:SetAttribute("Occupied", true)
 				end
 			end
 		end
@@ -101,7 +269,15 @@ PlaceEvent.OnServerEvent:Connect(function(player, tool, targetCFrame)
 		tool:Destroy()
 	end
 
-	local container = workspace:FindFirstChild("PlacedStructures") or Instance.new("Folder", workspace)
-	container.Name = "PlacedStructures"
+	local container = workspace:FindFirstChild("PlacedStructures")
+	if not container then
+		container = Instance.new("Folder")
+		container.Name = "PlacedStructures"
+		container.Parent = workspace
+	end
 	placedItem.Parent = container
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	playerCooldowns[player] = nil
 end)
