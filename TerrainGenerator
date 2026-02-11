@@ -1,0 +1,234 @@
+local islandRadius = 200 
+local maxHeight = 18 
+local landBlockSize = 4
+local chunkSize = 32 
+
+local baseLandColor = Color3.fromRGB(46, 139, 87)
+local sandColor = Color3.fromRGB(194, 178, 128)
+
+local landNoiseScale = 0.007 
+local detailNoiseScale = 0.05 
+local heightPrecision = 1 
+
+local treeProbability = 0.03
+local stoneProbability = 0.005
+local minTreeDistance = 40
+local minStoneDistance = 40
+
+local function generateSeed()
+	return math.random(1, 1000000)
+end
+
+local seed = generateSeed()
+local shapeSeed = generateSeed()
+math.randomseed(seed)
+
+local function getSmoothHeight(x, z)
+	local distance = math.sqrt(x * x + z * z)
+	local angle = math.atan2(z, x)
+
+	local radiusWarp = math.noise(math.cos(angle) * 1.8, math.sin(angle) * 1.8, shapeSeed) * 70
+	local adjustedRadius = islandRadius + radiusWarp
+
+	local distFromEdge = adjustedRadius - distance
+	if distFromEdge < -15 then return -12 end 
+
+	local falloff = math.clamp(distFromEdge / 40, 0, 1)
+	local curve = falloff * falloff * (3 - 2 * falloff)
+
+	local directionalBias = (x + z) / (islandRadius * 2) 
+	local elevationShift = (directionalBias + 1) * 5 
+
+	local n1 = math.noise(x * landNoiseScale, z * landNoiseScale, seed)
+	local n2 = math.noise(x * detailNoiseScale, z * detailNoiseScale, seed + 1) * 0.2
+
+	local height = ((n1 + n2 + 0.5) * maxHeight * curve) + elevationShift + (curve * 5) - 8
+
+	if distFromEdge > 40 then
+		height = math.max(height, 2)
+	end
+
+	return math.floor(height / heightPrecision) * heightPrecision
+end
+
+local function getMaterialAndColor(x, z, height)
+	local distance = math.sqrt(x * x + z * z)
+	local angle = math.atan2(z, x)
+	local radiusWarp = math.noise(math.cos(angle) * 1.8, math.sin(angle) * 1.8, shapeSeed) * 70
+	local adjustedRadius = islandRadius + radiusWarp
+	local distFromEdge = adjustedRadius - distance
+
+	if distFromEdge < 14 then
+		return Enum.Material.Sand, sandColor, "Sand"
+	else
+		return Enum.Material.SmoothPlastic, baseLandColor, "Grass"
+	end
+end
+
+-- Efficient socket placement
+local function addSocketsToBlock(block)
+	local socketsFolder = Instance.new("Folder")
+	socketsFolder.Name = "Sockets"
+	socketsFolder.Parent = block
+
+	local half = landBlockSize / 2
+	local topY = block.Size.Y / 2
+
+	-- Foundation Sockets (Side snapping)
+	local fPositions = {
+		{CFrame.new(half, 0, 0), "Right"},
+		{CFrame.new(-half, 0, 0), "Left"},
+		{CFrame.new(0, 0, half), "Back"},
+		{CFrame.new(0, 0, -half), "Front"}
+	}
+
+	-- Wall Sockets (Top edge snapping)
+	local wPositions = {
+		{CFrame.new(half, topY, 0) * CFrame.Angles(0, math.rad(90), 0), "Right"},
+		{CFrame.new(-half, topY, 0) * CFrame.Angles(0, math.rad(-90), 0), "Left"},
+		{CFrame.new(0, topY, half) * CFrame.Angles(0, math.rad(180), 0), "Back"},
+		{CFrame.new(0, topY, -half) * CFrame.Angles(0, 0, 0), "Front"}
+	}
+
+	for _, data in ipairs(fPositions) do
+		local att = Instance.new("Attachment")
+		att.Name = "FoundationSocket"
+		att.CFrame = data[1]
+		att.Parent = socketsFolder
+	end
+
+	for _, data in ipairs(wPositions) do
+		local att = Instance.new("Attachment")
+		att.Name = "WallSocket"
+		att.CFrame = data[1]
+		att.Parent = socketsFolder
+	end
+end
+
+local function createBlock(position, height)
+	local material, color, name = getMaterialAndColor(position.X, position.Z, height)
+
+	-- OPTIMIZATION: Sand blocks are now thin tiles (Size 1), Grass blocks have depth
+	local isSand = (name == "Sand")
+	local visualHeight = isSand and 1 or (height - (-15)) 
+	local centerY = isSand and height or (height + (-15)) / 2
+
+	local block = Instance.new("Part")
+	block.Name = name
+	block.Size = Vector3.new(landBlockSize, visualHeight, landBlockSize)
+	block.Position = Vector3.new(position.X, centerY, position.Z)
+	block.Anchored = true
+	block.Material = material
+	block.Color = color
+	block.TopSurface = Enum.SurfaceType.Smooth
+	block.CanCollide = true
+	block:SetAttribute("Occupied", false)
+	block.Parent = workspace:FindFirstChild("CustomTerrain")
+
+	-- Only add sockets to Grass blocks
+	if name == "Grass" then
+		addSocketsToBlock(block)
+	end
+
+	return block
+end
+
+-- Teleport logic moved to generateTerrain to prevent multiple calls
+local hasTeleported = false
+local function teleportPlayers(spawnPos)
+	if hasTeleported then return end
+	hasTeleported = true
+	task.wait(1)
+	local Players = game:GetService("Players")
+	for _, player in pairs(Players:GetPlayers()) do
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+			player.Character.HumanoidRootPart.CFrame = CFrame.new(spawnPos + Vector3.new(0, 5, 0))
+		end
+	end
+end
+
+local function placeDecorInChunk(blocksInChunk, treesFolder, stonesFolder)
+	local treeSource = game.ReplicatedStorage:FindFirstChild("Trees")
+	local stoneSource = game.ReplicatedStorage:FindFirstChild("Stones")
+	if not treeSource or not stoneSource then return end
+
+	local function tryPlace(items, prob, minDist, name, parentFolder)
+		local children = items:GetChildren()
+		local spots = {}
+
+		for _, block in pairs(blocksInChunk) do
+			local topY = block.Position.Y + (block.Size.Y / 2)
+			if block.Name == "Grass" and topY >= 2 and math.random() < prob then
+				local tooClose = false
+				for _, pos in pairs(spots) do
+					if (block.Position - pos).Magnitude < minDist then tooClose = true break end
+				end
+				if not tooClose then
+					block:SetAttribute("Occupied", true)
+					local model = children[math.random(1, #children)]:Clone()
+					model:SetPrimaryPartCFrame(CFrame.new(Vector3.new(block.Position.X, topY, block.Position.Z)) * CFrame.Angles(0, math.rad(math.random(0,360)), 0))
+					model.Parent = parentFolder
+					table.insert(spots, block.Position)
+				end
+			end
+		end
+	end
+	tryPlace(treeSource, treeProbability, minTreeDistance, "Tree", treesFolder)
+	tryPlace(stoneSource, stoneProbability, minStoneDistance, "Stone", stonesFolder)
+end
+
+local function generateTerrain()
+	local terrainFolder = Instance.new("Folder", workspace)
+	terrainFolder.Name = "CustomTerrain"
+	local treesFolder = Instance.new("Folder", workspace)
+	treesFolder.Name = "Trees"
+	local stonesFolder = Instance.new("Folder", workspace)
+	stonesFolder.Name = "Stones"
+
+	local bounds = islandRadius + 80 -- Reduced bounds to stop unnecessary water blocks
+	for cx = -bounds, bounds, chunkSize do
+		for cz = -bounds, bounds, chunkSize do
+			local chunkBlocks = {}
+			local hasLand = false
+
+			for x = cx, cx + chunkSize - landBlockSize, landBlockSize do
+				for z = cz, cz + chunkSize - landBlockSize, landBlockSize do
+					local height = getSmoothHeight(x, z)
+
+					-- Only create blocks that are "visible" land
+					if height >= -10 then 
+						hasLand = true
+						local block = createBlock(Vector3.new(x, height, z), height)
+						table.insert(chunkBlocks, block)
+
+						-- Teleport check
+						if not hasTeleported and math.abs(x) < 5 and math.abs(z) < 5 then
+							teleportPlayers(Vector3.new(x, height, z))
+						end
+					end
+				end
+			end
+
+			if hasLand then 
+				placeDecorInChunk(chunkBlocks, treesFolder, stonesFolder) 
+			end
+			task.wait() 
+		end
+	end
+end
+
+local function createWater()
+	local water = Instance.new("Part")
+	water.Name = "Ocean"
+	water.Size = Vector3.new(5000, 6, 5000) -- Smaller ocean part
+	water.Position = Vector3.new(0, -5.5, 0)
+	water.Anchored = true
+	water.CanCollide = false
+	water.Transparency = 0.5
+	water.Color = Color3.fromRGB(0, 130, 190)
+	water.Material = Enum.Material.Glass
+	water.Parent = workspace
+end
+
+createWater()
+generateTerrain()
