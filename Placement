@@ -1,0 +1,123 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PlaceEvent = ReplicatedStorage:WaitForChild("PlaceItemEvent")
+local GRID_SIZE = 4
+
+local itemFolders = {
+	ReplicatedStorage:WaitForChild("CraftableItems"),
+	ReplicatedStorage:WaitForChild("CraftingBenchItems"),
+	ReplicatedStorage:WaitForChild("Resources")
+}
+
+local playerCooldowns = {} 
+
+local function findModel(name)
+	for _, folder in ipairs(itemFolders) do
+		local found = folder:FindFirstChild(name)
+		if found then return found end
+	end
+	return nil
+end
+
+PlaceEvent.OnServerEvent:Connect(function(player, tool, targetCFrame)
+	-- 1. Anti-Spam & Validation
+	if playerCooldowns[player] and tick() - playerCooldowns[player] < 0.2 then return end
+	playerCooldowns[player] = tick()
+
+	-- Safety: Ensure we received a valid CFrame
+	if not tool or not tool:IsA("Tool") or typeof(targetCFrame) ~= "CFrame" then return end
+
+	local character = player.Character
+	if not character or not character:FindFirstChild("HumanoidRootPart") then return end
+
+	-- Distance check
+	if (character.HumanoidRootPart.Position - targetCFrame.Position).Magnitude > 50 then 
+		warn(player.Name .. " tried placing too far away!")
+		return 
+	end
+
+	local toolName = tool.Name
+	local isStructure = tool:GetAttribute("Structure") or false
+	local sx, sy = tool:GetAttribute("SizeX") or 1, tool:GetAttribute("SizeY") or 1
+
+	-- 2. SERVER-SIDE OCCUPANCY VALIDATION
+	-- Check if we are placing on a socket that is already occupied
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+	overlapParams.FilterDescendantsInstances = {character}
+
+	local bounds = workspace:GetPartBoundsInBox(targetCFrame, Vector3.new(1, 1, 1), overlapParams)
+	for _, part in ipairs(bounds) do
+		if part:GetAttribute("Occupied") or (isStructure and part:GetAttribute("Structure")) then
+			warn("Server Blocked: Space or Socket already occupied!")
+			return 
+		end
+	end
+
+	-- 3. Find and Clone Model
+	local sourceModel = findModel(toolName)
+	if not sourceModel then return end
+
+	local placedItem = sourceModel:Clone()
+
+	-- Tool-to-Model Conversion (If source is a Tool object)
+	if placedItem:IsA("Tool") then
+		local newModel = Instance.new("Model")
+		newModel.Name = toolName
+		for _, child in ipairs(placedItem:GetChildren()) do
+			if child:IsA("BasePart") or child:IsA("Model") then child.Parent = newModel end
+		end
+		placedItem = newModel
+	else
+		placedItem.Name = toolName
+	end
+
+	-- 4. Position the Item
+	placedItem:PivotTo(targetCFrame)
+
+	-- 5. Set Physics, Attributes, and Clean Scripts
+	for _, desc in ipairs(placedItem:GetDescendants()) do
+		if desc:IsA("BasePart") then 
+			desc.Anchored = true
+			desc.CanCollide = true
+
+			-- Only name it "Foundation" if it actually IS a foundation tool
+			-- Otherwise, give it the Structure attribute
+			if isStructure then 
+				desc:SetAttribute("Structure", true) 
+			elseif toolName == "Foundation" then
+				desc.Name = "Foundation"
+			end
+		elseif desc:IsA("Script") or desc:IsA("LocalScript") then 
+			desc:Destroy() 
+		end
+	end
+
+	-- 6. Occupancy Logic for Grass (Non-Structures like Foundations)
+	if not isStructure then
+		local startX = targetCFrame.Position.X - (sx * GRID_SIZE / 2)
+		local startZ = targetCFrame.Position.Z - (sy * GRID_SIZE / 2)
+
+		for x = 0, sx - 1 do
+			for z = 0, sy - 1 do
+				local checkX = startX + (x * GRID_SIZE) + (GRID_SIZE / 2)
+				local checkZ = startZ + (z * GRID_SIZE) + (GRID_SIZE / 2)
+
+				-- Raycast down to find the Grass tile
+				local occRay = workspace:Raycast(Vector3.new(checkX, targetCFrame.Position.Y + 2, checkZ), Vector3.new(0, -5, 0))
+				if occRay and occRay.Instance.Name == "Grass" then 
+					occRay.Instance:SetAttribute("Occupied", true) 
+				end
+			end
+		end
+	end
+
+	-- 7. Resource Consumption
+	local amount = tool:GetAttribute("Amount") or 1
+	if amount > 1 then
+		tool:SetAttribute("Amount", amount - 1)
+	else
+		tool:Destroy()
+	end
+
+	placedItem.Parent = workspace
+end)
