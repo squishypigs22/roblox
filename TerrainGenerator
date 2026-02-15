@@ -1,19 +1,25 @@
-local islandRadius = 200 
-local maxHeight = 18 
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local islandRadius = 200
+local maxHeight = 18
 local landBlockSize = 4
-local chunkSize = 32 
+local chunkSize = 32
+local floorY = -20
+local seaCullY = -10
 
 local baseLandColor = Color3.fromRGB(46, 139, 87)
 local sandColor = Color3.fromRGB(194, 178, 128)
 
-local landNoiseScale = 0.007 
-local detailNoiseScale = 0.05 
-local heightPrecision = 1 
+local landNoiseScale = 0.007
+local detailNoiseScale = 0.05
 
 local treeProbability = 0.03
 local stoneProbability = 0.005
 local minTreeDistance = 40
 local minStoneDistance = 40
+
+local decorActiveRadius = 140
 
 local function generateSeed()
 	return math.random(1, 1000000)
@@ -23,35 +29,33 @@ local seed = generateSeed()
 local shapeSeed = generateSeed()
 math.randomseed(seed)
 
-local function getSmoothHeight(x, z)
+local function getHeight(x, z)
 	local distance = math.sqrt(x * x + z * z)
 	local angle = math.atan2(z, x)
 
 	local radiusWarp = math.noise(math.cos(angle) * 1.8, math.sin(angle) * 1.8, shapeSeed) * 70
 	local adjustedRadius = islandRadius + radiusWarp
-
 	local distFromEdge = adjustedRadius - distance
-	if distFromEdge < -10 then return nil end 
+
+	if distFromEdge < -10 then
+		return nil
+	end
 
 	local falloff = math.clamp(distFromEdge / 40, 0, 1)
-	local curve = falloff * falloff * (3 - 2 * falloff)
-
-	local directionalBias = (x + z) / (islandRadius * 2) 
-	local elevationShift = (directionalBias + 1) * 5 
-
 	local n1 = math.noise(x * landNoiseScale, z * landNoiseScale, seed)
 	local n2 = math.noise(x * detailNoiseScale, z * detailNoiseScale, seed + 1) * 0.2
 
-	local height = ((n1 + n2 + 0.5) * maxHeight * curve) + elevationShift + (curve * 5) - 8
+	local height = ((n1 + n2) * maxHeight) * falloff
+	height += (falloff * 8)
 
 	if distFromEdge > 40 then
 		height = math.max(height, 2)
 	end
 
-	return math.floor(height / heightPrecision) * heightPrecision
+	return math.floor(height)
 end
 
-local function getMaterialAndColor(x, z, height)
+local function getMaterialAndColor(x, z)
 	local distance = math.sqrt(x * x + z * z)
 	local angle = math.atan2(z, x)
 	local radiusWarp = math.noise(math.cos(angle) * 1.8, math.sin(angle) * 1.8, shapeSeed) * 70
@@ -60,103 +64,142 @@ local function getMaterialAndColor(x, z, height)
 
 	if distFromEdge < 14 then
 		return Enum.Material.Sand, sandColor, "Sand"
-	else
-		return Enum.Material.SmoothPlastic, baseLandColor, "Grass"
 	end
+
+	return Enum.Material.SmoothPlastic, baseLandColor, "Grass"
 end
 
-local function addSocketsToBlock(block)
-	local half = landBlockSize / 2
-	local topY = block.Size.Y / 2
-
-	local fPositions = {
-		CFrame.new(half, 0, 0), CFrame.new(-half, 0, 0),
-		CFrame.new(0, 0, half), CFrame.new(0, 0, -half)
-	}
-
-	for _, cf in ipairs(fPositions) do
-		local att = Instance.new("Attachment")
-		att.Name = "FoundationSocket"
-		att.CFrame = cf
-		att.Parent = block
+local function createBlock(terrainFolder, position, topHeight)
+	if topHeight < seaCullY then
+		return nil
 	end
-end
 
-local function createBlock(position, height)
-	local material, color, name = getMaterialAndColor(position.X, position.Z, height)
-	local isSand = (name == "Sand")
-	local depth = isSand and 2 or 8
-	local centerY = height - (depth/2)
+	local material, color, name = getMaterialAndColor(position.X, position.Z)
+	local blockHeight = math.max(1, topHeight - floorY)
+	local centerY = floorY + (blockHeight / 2)
 
 	local block = Instance.new("Part")
 	block.Name = name
-	block.Size = Vector3.new(landBlockSize, depth, landBlockSize)
+	block.Size = Vector3.new(landBlockSize, blockHeight, landBlockSize)
 	block.Position = Vector3.new(position.X, centerY, position.Z)
 	block.Anchored = true
 	block.Material = material
 	block.Color = color
 	block.TopSurface = Enum.SurfaceType.Smooth
+	block.BottomSurface = Enum.SurfaceType.Smooth
 	block.CanCollide = true
+	block.CanQuery = true
 	block:SetAttribute("Occupied", false)
-	block.Parent = workspace:FindFirstChild("CustomTerrain")
+	block.Parent = terrainFolder
 
-	if name == "Grass" then
-		addSocketsToBlock(block)
-	end
 
 	return block
 end
 
-local hasTeleported = false
-local function teleportPlayers(spawnPos)
-	if hasTeleported then return end
-	hasTeleported = true
-	task.wait(1)
-	local Players = game:GetService("Players")
-	for _, player in pairs(Players:GetPlayers()) do
-		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-			player.Character.HumanoidRootPart.CFrame = CFrame.new(spawnPos + Vector3.new(0, 5, 0))
+local function setDecorActive(model, isActive)
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			desc.CanCollide = isActive
+			desc.CanQuery = isActive
 		end
 	end
 end
 
 local function placeDecorInChunk(blocksInChunk, treesFolder, stonesFolder)
-	local treeSource = game.ReplicatedStorage:FindFirstChild("Trees")
-	local stoneSource = game.ReplicatedStorage:FindFirstChild("Stones")
-	if not treeSource or not stoneSource then return end
+	local treeSource = ReplicatedStorage:FindFirstChild("Trees")
+	local stoneSource = ReplicatedStorage:FindFirstChild("Stones")
+	if not treeSource or not stoneSource then
+		return
+	end
 
-	local function tryPlace(items, prob, minDist, name, parentFolder)
+	local function tryPlace(items, probability, minDistance, parentFolder)
 		local children = items:GetChildren()
+		if #children == 0 then
+			return
+		end
+
 		local spots = {}
 
-		for _, block in pairs(blocksInChunk) do
+		for _, block in ipairs(blocksInChunk) do
 			local topY = block.Position.Y + (block.Size.Y / 2)
-			if block.Name == "Grass" and topY >= 1 and math.random() < prob then
+			if block.Name == "Grass" and topY >= 1 and math.random() < probability then
 				local tooClose = false
-				for _, pos in pairs(spots) do
-					if (block.Position - pos).Magnitude < minDist then tooClose = true break end
+				for _, pos in ipairs(spots) do
+					if (block.Position - pos).Magnitude < minDistance then
+						tooClose = true
+						break
+					end
 				end
+
 				if not tooClose then
-					block:SetAttribute("Occupied", true)
 					local model = children[math.random(1, #children)]:Clone()
-					model:SetPrimaryPartCFrame(CFrame.new(Vector3.new(block.Position.X, topY, block.Position.Z)) * CFrame.Angles(0, math.rad(math.random(0,360)), 0))
+					model:PivotTo(CFrame.new(Vector3.new(block.Position.X, topY, block.Position.Z)) * CFrame.Angles(0, math.rad(math.random(0, 360)), 0))
 					model.Parent = parentFolder
+					setDecorActive(model, false)
 					table.insert(spots, block.Position)
 				end
 			end
 		end
 	end
-	tryPlace(treeSource, treeProbability, minTreeDistance, "Tree", treesFolder)
-	tryPlace(stoneSource, stoneProbability, minStoneDistance, "Stone", stonesFolder)
+
+	tryPlace(treeSource, treeProbability, minTreeDistance, treesFolder)
+	tryPlace(stoneSource, stoneProbability, minStoneDistance, stonesFolder)
+end
+
+local function updateDecorPhysics(treesFolder, stonesFolder)
+	local function nearestPlayerDistance(position)
+		local nearest = math.huge
+		for _, player in ipairs(Players:GetPlayers()) do
+			local character = player.Character
+			local hrp = character and character:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				local d = (hrp.Position - position).Magnitude
+				if d < nearest then
+					nearest = d
+				end
+			end
+		end
+		return nearest
+	end
+
+	for _, folder in ipairs({ treesFolder, stonesFolder }) do
+		for _, model in ipairs(folder:GetChildren()) do
+			local pivot = model:GetPivot()
+			local active = nearestPlayerDistance(pivot.Position) <= decorActiveRadius
+			setDecorActive(model, active)
+		end
+	end
+end
+
+local hasTeleported = false
+local function teleportPlayers(spawnPos)
+	if hasTeleported then
+		return
+	end
+	hasTeleported = true
+	task.wait(1)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local hrp = character and character:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			hrp.CFrame = CFrame.new(spawnPos + Vector3.new(0, 6, 0))
+		end
+	end
 end
 
 local function generateTerrain()
-	local terrainFolder = Instance.new("Folder", workspace)
+	local terrainFolder = Instance.new("Folder")
 	terrainFolder.Name = "CustomTerrain"
-	local treesFolder = Instance.new("Folder", workspace)
+	terrainFolder.Parent = workspace
+
+	local treesFolder = Instance.new("Folder")
 	treesFolder.Name = "Trees"
-	local stonesFolder = Instance.new("Folder", workspace)
+	treesFolder.Parent = workspace
+
+	local stonesFolder = Instance.new("Folder")
 	stonesFolder.Name = "Stones"
+	stonesFolder.Parent = workspace
 
 	local bounds = islandRadius + 40
 	for cx = -bounds, bounds, chunkSize do
@@ -166,30 +209,44 @@ local function generateTerrain()
 
 			for x = cx, cx + chunkSize - landBlockSize, landBlockSize do
 				for z = cz, cz + chunkSize - landBlockSize, landBlockSize do
-					local height = getSmoothHeight(x, z)
-					if height then 
+					local topHeight = getHeight(x, z)
+					if topHeight and topHeight >= seaCullY then
 						hasLand = true
-						local block = createBlock(Vector3.new(x, height, z), height)
-						table.insert(chunkBlocks, block)
-						if not hasTeleported and math.abs(x) < 5 and math.abs(z) < 5 then
-							teleportPlayers(Vector3.new(x, height, z))
+						local block = createBlock(terrainFolder, Vector3.new(x, 0, z), topHeight)
+						if block then
+							table.insert(chunkBlocks, block)
+							if not hasTeleported and math.abs(x) < 5 and math.abs(z) < 5 then
+								teleportPlayers(Vector3.new(x, topHeight, z))
+							end
 						end
 					end
 				end
 			end
-			if hasLand then placeDecorInChunk(chunkBlocks, treesFolder, stonesFolder) end
-			task.wait() 
+
+			if hasLand then
+				placeDecorInChunk(chunkBlocks, treesFolder, stonesFolder)
+			end
+
+			task.wait()
 		end
 	end
+
+	task.spawn(function()
+		while true do
+			updateDecorPhysics(treesFolder, stonesFolder)
+			task.wait(1)
+		end
+	end)
 end
 
 local function createWater()
 	local water = Instance.new("Part")
 	water.Name = "Ocean"
 	water.Size = Vector3.new(2000, 2, 2000)
-	water.Position = Vector3.new(0, -4, 0)
+	water.Position = Vector3.new(0, -3.5, 0)
 	water.Anchored = true
 	water.CanCollide = false
+	water.CanQuery = false
 	water.Transparency = 0.5
 	water.Color = Color3.fromRGB(0, 130, 190)
 	water.Material = Enum.Material.Glass
